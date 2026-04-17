@@ -126,9 +126,12 @@
         const ms = Math.round(performance.now() - t0);
 
         if (json.type === "prediction") {
+          const displayTrainName = json.trainName || "-";
+          const displayTrainNumber = json.trainNumber ?? "-";
+          const displayTrainType = json.trainType || "-";
           renderBlock(
             "Prediction",
-            `Train: ${json.train || "-"}\nResult: ${json.message}\nProbability: ${json.probability}`,
+            `Train: ${json.train || "-"}\nTrain Name: ${displayTrainName}\nTrain Number: ${displayTrainNumber}\nTrain Type: ${displayTrainType}\nResult: ${json.message}\nProbability: ${json.probability}`,
             `${ms}ms`
           );
         } else if (json.type === "graph") {
@@ -152,7 +155,9 @@
             return `- Train ${trainNumber || "N/A"}${trainType ? ` [${trainType}]` : ""}`;
           });
 
-          const uniqueDirect = isRouteQuery ? directFromApi : (directFromApi.length ? directFromApi : lines);
+          const uniqueDirect = isRouteQuery
+            ? (directFromApi.length ? directFromApi : lines)
+            : (directFromApi.length ? directFromApi : lines);
           const directSection = uniqueDirect.length
             ? `Direct trains:\n${uniqueDirect.join("\n")}`
             : "Direct trains:\n- No direct trains found";
@@ -209,6 +214,7 @@
         }
 
         const body = [
+          `ML Accuracy: ${Number(json.accuracy || 0).toFixed(4)}`,
           `Accuracy: ${Number(json.accuracy || 0).toFixed(4)}`,
           `Precision: ${Number(json.precision || 0).toFixed(4)}`,
           `Recall: ${Number(json.recall || 0).toFixed(4)}`,
@@ -216,7 +222,11 @@
           `CV F1 Mean: ${Number(json.cv_f1_mean || 0).toFixed(4)}`,
           `CV F1 Std: ${Number(json.cv_f1_std || 0).toFixed(4)}`,
           `Baseline Accuracy: ${Number(json.baseline_accuracy || 0).toFixed(4)}`,
-          `Samples: ${json.samples || 0}`
+          `Samples: ${json.samples || 0}`,
+          `Source: ${json.source || "unknown"}`,
+          ...(json.model_name ? [`Model: ${json.model_name}`] : []),
+          ...(json.threshold != null ? [`Threshold: ${Number(json.threshold).toFixed(2)}`] : []),
+          ...(json.warning ? ["", `⚠ ${json.warning}`] : [])
         ].join("\n");
 
         renderBlock("ML Evaluation", body, `${ms}ms`);
@@ -238,7 +248,7 @@
       const t0 = performance.now();
       status.textContent = "Running KG evaluation...";
       try {
-        const res = await fetch("/api/evaluate/kg?sampleSize=100&maxHops=3&timeoutMs=2000&pathLimit=3");
+        const res = await fetch("/api/evaluate/kg?sampleSize=40&maxHops=3&timeoutMs=1200&pathLimit=3&concurrency=8");
         const json = await res.json();
         const ms = Math.round(performance.now() - t0);
 
@@ -256,12 +266,25 @@
         });
 
         const body = [
+          `KG Accuracy: ${Number((json.recallAtKPercent ?? json.coveragePercent) || 0).toFixed(2)}%`,
           `Coverage: ${Number(json.coveragePercent || 0).toFixed(2)}%`,
+          `Recall@K: ${Number(json.recallAtKPercent || 0).toFixed(2)}%`,
+          `Miss Rate: ${Number(json.missRatePercent || 0).toFixed(2)}%`,
+          `Timeout Rate: ${Number(json.timeoutRatePercent || 0).toFixed(2)}%`,
+          `Error Rate: ${Number(json.errorRatePercent || 0).toFixed(2)}%`,
+          `Direct Hit Rate: ${Number(json.directHitRatePercent || 0).toFixed(2)}%`,
+          `Multi-hop Hit Rate: ${Number(json.multiHopHitRatePercent || 0).toFixed(2)}%`,
           `Sample Size: ${json.sampleSize || 0}`,
+          `Evaluated: ${json.evaluatedCount || 0}`,
+          `Unique Pairs: ${json.uniqueEvaluatedPairs || 0}`,
           `Success Count: ${json.successCount || 0}`,
+          `No Path Count: ${json.noPathCount || 0}`,
+          `Failed Error Count: ${json.failedErrorCount || 0}`,
           `Direct Paths: ${json.directCount || 0}`,
           `Multi-hop Paths: ${json.multiHopCount || 0}`,
           `Timed Out: ${json.timedOut || 0}`,
+          `Latency Avg/P50/P95 (ms): ${Number(json.latencyMs?.avg || 0).toFixed(2)} / ${Number(json.latencyMs?.p50 || 0).toFixed(2)} / ${Number(json.latencyMs?.p95 || 0).toFixed(2)}`,
+          `Hops Avg/P95: ${Number(json.hops?.avg || 0).toFixed(2)} / ${Number(json.hops?.p95 || 0).toFixed(2)}`,
           "",
           "Successful examples:",
           ...(successExamples.length ? successExamples : ["- None"]),

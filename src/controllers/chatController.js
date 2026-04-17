@@ -73,6 +73,7 @@ export const chatHandler = async (req, res) => {
       console.log("KG Data:", kgData);
 
       let bestPrediction = null;
+      let selectedTrain = null;
 
       // 🧠 Step 3: If train number is provided, predict for that train only
       if (entities.trainNumber) {
@@ -80,6 +81,11 @@ export const chatHandler = async (req, res) => {
         console.log("Final Features:", features);
 
         bestPrediction = await getPrediction(features);
+        selectedTrain = {
+          number: Number(entities.trainNumber),
+          name: `Train ${entities.trainNumber}`,
+          type: "Express"
+        };
         console.log("Prediction:", bestPrediction);
       } else {
         // 🧠 Step 3b: No specific train, find the BEST train for this confirmation
@@ -110,14 +116,17 @@ export const chatHandler = async (req, res) => {
         }
 
         // 🎯 Find best prediction (highest probability)
-        bestPrediction = predictions.reduce(
+        const bestResult = predictions.reduce(
           (best, current) => {
             const currentProb = current.prediction?.probability ?? 0;
             const bestProb = best?.prediction?.probability ?? 0;
             return currentProb > bestProb ? current : best;
           },
           predictions[0]
-        )?.prediction;
+        );
+
+        selectedTrain = bestResult?.train || null;
+        bestPrediction = bestResult?.prediction || null;
 
         if (!bestPrediction) {
           throw new Error("Could not get prediction for any train on this route");
@@ -134,7 +143,14 @@ export const chatHandler = async (req, res) => {
       }
 
       // Extract train info from model response
-      const train = bestPrediction?.train ?? null;
+      const trainName = selectedTrain?.name || null;
+      const trainNumber = selectedTrain?.number || null;
+      const trainType = selectedTrain?.type || null;
+      const train = (
+        trainName
+          ? `${trainName}${trainNumber ? ` (${trainNumber})` : ""}${trainType ? ` [${trainType}]` : ""}`
+          : null
+      ) || bestPrediction?.train || null;
       const pnr = bestPrediction?.pnr ?? null;
 
       // Extract prediction status from model response
@@ -155,6 +171,9 @@ export const chatHandler = async (req, res) => {
       return res.json({
         type: "prediction",
         train,
+        trainName,
+        trainNumber,
+        trainType,
         pnr,
         probability: Number(prob.toFixed(4)),
         prediction: predictionStatus,
@@ -216,7 +235,7 @@ export const chatHandler = async (req, res) => {
     return res.json({
       type: "graph",
       cypher,
-      result: isRouteQuery ? [] : dbResult,
+      result: dbResult,
       directTrains,
       multiHop,
       route,
@@ -247,21 +266,37 @@ export const mlEvaluationHandler = async (_req, res) => {
 
 export const kgEvaluationHandler = async (req, res) => {
   try {
-    const sampleSize = Number(req.query.sampleSize || process.env.EVAL_SAMPLE_SIZE || 100);
-    const maxHops = Number(req.query.maxHops || process.env.KG_EVAL_MAX_HOPS || 3);
-    const timeoutMs = Number(req.query.timeoutMs || process.env.KG_EVAL_TIMEOUT_MS || 2000);
-    const pathLimit = Number(req.query.pathLimit || process.env.KG_EVAL_PATH_LIMIT || 3);
+    const sampleSizeRaw = Number(req.query.sampleSize || process.env.EVAL_SAMPLE_SIZE || 40);
+    const maxHopsRaw = Number(req.query.maxHops || process.env.KG_EVAL_MAX_HOPS || 3);
+    const timeoutMsRaw = Number(req.query.timeoutMs || process.env.KG_EVAL_TIMEOUT_MS || 1200);
+    const pathLimitRaw = Number(req.query.pathLimit || process.env.KG_EVAL_PATH_LIMIT || 3);
+    const concurrencyRaw = Number(req.query.concurrency || process.env.KG_EVAL_CONCURRENCY || 8);
+
+    // Keep KG evaluation responsive even with stale UI/query params.
+    const sampleSize = Math.max(10, Math.min(50, Number.isFinite(sampleSizeRaw) ? sampleSizeRaw : 40));
+    const maxHops = Math.max(1, Math.min(4, Number.isFinite(maxHopsRaw) ? maxHopsRaw : 3));
+    const timeoutMs = Math.max(300, Math.min(1200, Number.isFinite(timeoutMsRaw) ? timeoutMsRaw : 1200));
+    const pathLimit = Math.max(1, Math.min(3, Number.isFinite(pathLimitRaw) ? pathLimitRaw : 3));
+    const concurrency = Math.max(1, Math.min(12, Number.isFinite(concurrencyRaw) ? concurrencyRaw : 8));
 
     const evaluation = await evaluateKnowledgeGraph({
       sampleSize,
       maxHops,
       queryTimeoutMs: timeoutMs,
       pathLimit,
+      concurrency,
       enableLogs: false,
     });
 
     return res.json({
       type: "kg-evaluation",
+      config: {
+        sampleSize,
+        maxHops,
+        timeoutMs,
+        pathLimit,
+        concurrency,
+      },
       ...evaluation,
     });
   } catch (err) {

@@ -9,7 +9,16 @@ dotenv.config();
 const app = express();
 
 app.use(express.json());
-app.use(express.static("public"));
+app.use(express.static("public", {
+  etag: false,
+  lastModified: false,
+  maxAge: 0,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith(".html")) {
+      res.setHeader("Cache-Control", "no-store");
+    }
+  }
+}));
 
 app.use((req, res, next) => {
   const start = Date.now();

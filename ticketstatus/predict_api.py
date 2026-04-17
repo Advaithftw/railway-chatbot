@@ -2,6 +2,10 @@ from fastapi import FastAPI
 import joblib
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier
+import numpy as np
 from pathlib import Path
 import os
 
@@ -193,6 +197,156 @@ def encode_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
             encoded[col] = 0
     return encoded[columns]
 
+
+def build_eval_dataframe() -> pd.DataFrame:
+    eval_df = dataset.copy()
+
+    eval_df["Waitlist Position"] = (
+        eval_df["Waitlist Position"].astype(str).str.extract(r"(\d+)")[0]
+    )
+    eval_df["Waitlist Position"] = pd.to_numeric(eval_df["Waitlist Position"], errors="coerce")
+
+    eval_df["Holiday or Peak Season"] = eval_df["Holiday or Peak Season"].map({
+        "Yes": 1,
+        "No": 0,
+        True: 1,
+        False: 0
+    })
+
+    eval_df["Confirmation Status"] = eval_df["Confirmation Status"].map({
+        "Confirmed": 1,
+        "Not Confirmed": 0
+    })
+
+    eval_df = eval_df.drop(columns=[
+        "PNR Number",
+        "Date of Journey",
+        "Booking Date",
+        "Current Status"
+    ], errors="ignore")
+
+    eval_df = eval_df.fillna({
+        "Seat Availability": 0,
+        "Travel Distance": eval_df["Travel Distance"].mean(),
+        "Waitlist Position": eval_df["Waitlist Position"].median(),
+    })
+
+    eval_df["Class of Travel"] = eval_df["Class of Travel"].map(normalize_travel_class)
+    eval_df = eval_df.dropna(subset=["Confirmation Status"])
+
+    return eval_df
+
+
+def detect_leakage(raw_df: pd.DataFrame) -> dict:
+    y = raw_df["Confirmation Status"].map({
+        "Confirmed": 1,
+        "Not Confirmed": 0
+    })
+
+    wl_series = pd.to_numeric(
+        raw_df["Waitlist Position"].astype(str).str.extract(r"(\d+)")[0],
+        errors="coerce"
+    )
+
+    valid_mask = y.notna()
+    y = y[valid_mask]
+    wl_series = wl_series[valid_mask]
+
+    wl_presence_by_target = (
+        pd.DataFrame({"target": y, "wl_present": wl_series.notna().astype(int)})
+        .groupby("target")["wl_present"]
+        .mean()
+        .to_dict()
+    )
+
+    confirmed_presence = float(wl_presence_by_target.get(1, 0.0))
+    not_confirmed_presence = float(wl_presence_by_target.get(0, 0.0))
+    separation_gap = abs(confirmed_presence - not_confirmed_presence)
+
+    return {
+        "waitlist_presence_confirmed": confirmed_presence,
+        "waitlist_presence_not_confirmed": not_confirmed_presence,
+        "waitlist_presence_gap": separation_gap,
+        "high_risk": separation_gap >= 0.95,
+    }
+
+
+def compute_holdout_metrics(x: pd.DataFrame, y: pd.Series, seed: int = 42) -> dict:
+    x_train, x_test, y_train, y_test = train_test_split(
+        x,
+        y,
+        test_size=0.2,
+        random_state=seed,
+        stratify=y,
+    )
+
+    x_fit, x_val, y_fit, y_val = train_test_split(
+        x_train,
+        y_train,
+        test_size=0.2,
+        random_state=seed,
+        stratify=y_train,
+    )
+
+    candidates = {
+        "random_forest": RandomForestClassifier(
+            n_estimators=300,
+            random_state=seed,
+            class_weight="balanced_subsample",
+            min_samples_leaf=2,
+            min_samples_split=4,
+            max_features="sqrt",
+            n_jobs=-1,
+        ),
+        "extra_trees": ExtraTreesClassifier(
+            n_estimators=400,
+            random_state=seed,
+            class_weight="balanced_subsample",
+            min_samples_leaf=1,
+            min_samples_split=4,
+            max_features="sqrt",
+            n_jobs=-1,
+        ),
+    }
+
+    best_name = None
+    best_model = None
+    best_threshold = 0.5
+    best_val_f1 = -1
+
+    for model_name, candidate in candidates.items():
+        candidate.fit(x_fit, y_fit)
+        val_prob = candidate.predict_proba(x_val)[:, 1]
+
+        local_best_f1 = -1
+        local_best_threshold = 0.5
+        for threshold in np.arange(0.30, 0.71, 0.02):
+            val_pred = (val_prob >= threshold).astype(int)
+            score = f1_score(y_val, val_pred, zero_division=0)
+            if score > local_best_f1:
+                local_best_f1 = score
+                local_best_threshold = float(threshold)
+
+        if local_best_f1 > best_val_f1:
+            best_val_f1 = local_best_f1
+            best_name = model_name
+            best_model = candidate
+            best_threshold = local_best_threshold
+
+    best_model.fit(x_train, y_train)
+    test_prob = best_model.predict_proba(x_test)[:, 1]
+    y_pred = (test_prob >= best_threshold).astype(int)
+
+    return {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+        "samples": int(len(y_test)),
+        "model_name": best_name,
+        "threshold": float(best_threshold),
+    }
+
 @app.post("/predict")
 def predict(data: dict):
     """
@@ -250,60 +404,58 @@ def predict(data: dict):
 def metrics():
     load_artifacts()
 
+    eval_df = build_eval_dataframe()
+    y_true = eval_df["Confirmation Status"]
+    baseline = float(max(y_true.mean(), 1 - y_true.mean())) if len(y_true) else 0.0
+    leakage = detect_leakage(dataset)
+
+    raw_metrics = None
     if METRICS_PATH.exists():
         try:
             import json
             with open(METRICS_PATH, "r") as f:
                 saved_metrics = json.load(f)
-            return {
+            raw_metrics = {
                 "accuracy": float(saved_metrics.get("accuracy", 0.0)),
                 "precision": float(saved_metrics.get("precision", 0.0)),
                 "recall": float(saved_metrics.get("recall", 0.0)),
                 "f1": float(saved_metrics.get("f1", 0.0)),
                 "cv_f1_mean": float(saved_metrics.get("cv_f1_mean", 0.0)),
                 "cv_f1_std": float(saved_metrics.get("cv_f1_std", 0.0)),
-                "baseline_accuracy": float(saved_metrics.get("baseline_accuracy", 0.0)),
+                "baseline_accuracy": float(saved_metrics.get("baseline_accuracy", baseline)),
                 "samples": int(saved_metrics.get("test_samples", saved_metrics.get("samples", 0))),
                 "source": "metrics.json"
             }
         except Exception:
-            pass
+            raw_metrics = None
 
-    eval_df = dataset.copy()
-
-    eval_df["Waitlist Position"] = (
-        eval_df["Waitlist Position"].astype(str).str.extract(r"(\d+)")[0]
+    has_perfect_raw = bool(raw_metrics) and all(
+        raw_metrics.get(metric, 0.0) >= 0.9999
+        for metric in ["accuracy", "precision", "recall", "f1"]
     )
-    eval_df["Waitlist Position"] = pd.to_numeric(eval_df["Waitlist Position"], errors="coerce")
 
-    eval_df["Holiday or Peak Season"] = eval_df["Holiday or Peak Season"].map({
-        "Yes": 1,
-        "No": 0,
-        True: 1,
-        False: 0
-    })
+    if leakage["high_risk"] or has_perfect_raw:
+        x_safe = eval_df.drop(columns=["Confirmation Status", "Waitlist Position"], errors="ignore")
+        x_safe = pd.get_dummies(x_safe)
+        robust = compute_holdout_metrics(x_safe, y_true)
 
-    eval_df["Confirmation Status"] = eval_df["Confirmation Status"].map({
-        "Confirmed": 1,
-        "Not Confirmed": 0
-    })
+        return {
+            "accuracy": robust["accuracy"],
+            "precision": robust["precision"],
+            "recall": robust["recall"],
+            "f1": robust["f1"],
+            "cv_f1_mean": 0.0,
+            "cv_f1_std": 0.0,
+            "baseline_accuracy": baseline,
+            "samples": robust["samples"],
+            "source": "leakage_robust_holdout",
+            "model_name": robust.get("model_name"),
+            "threshold": robust.get("threshold"),
+            "warning": "Potential target leakage detected in dataset. Showing leakage-robust holdout metrics (without Waitlist Position) instead of optimistic raw metrics.",
+            "leakage": leakage,
+            "raw_metrics": raw_metrics,
+        }
 
-    eval_df = eval_df.drop(columns=[
-        "PNR Number",
-        "Date of Journey",
-        "Booking Date",
-        "Current Status"
-    ], errors="ignore")
-
-    eval_df = eval_df.fillna({
-        "Seat Availability": 0,
-        "Travel Distance": eval_df["Travel Distance"].mean(),
-        "Waitlist Position": eval_df["Waitlist Position"].median(),
-    })
-
-    eval_df["Class of Travel"] = eval_df["Class of Travel"].map(normalize_travel_class)
-
-    y_true = eval_df["Confirmation Status"]
     x_raw = eval_df.drop(columns=["Confirmation Status"])
     x_eval = encode_features_for_model(x_raw)
 

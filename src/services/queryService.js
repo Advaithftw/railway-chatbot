@@ -4,6 +4,23 @@ const ROUTE_CACHE_TTL_MS = Number(process.env.ROUTE_CACHE_TTL_MS || 5 * 60 * 100
 const routeFeatureCache = new Map();
 const stationConnectionCache = new Map();
 
+const CITY_STATION_ALIASES = {
+  chennai: ["MAS", "MS", "TBM", "PER"],
+  mumbai: ["CSMT", "BCT", "MMCT", "LTT", "DR", "PNVL"],
+  delhi: ["NDLS", "DLI", "NZM", "ANVT", "DEE"],
+  kolkata: ["HWH", "KOAA", "SDAH"],
+  bangalore: ["SBC", "YPR", "KJM", "BNC"],
+  bengaluru: ["SBC", "YPR", "KJM", "BNC"],
+  hyderabad: ["SC", "HYB", "KCG", "BMT"],
+  pune: ["PUNE"],
+  ahmedabad: ["ADI"],
+  jaipur: ["JP"],
+  patna: ["PNBE"],
+  lucknow: ["LKO"],
+  varanasi: ["BSB"],
+  surat: ["ST"],
+};
+
 const escapeForCypher = (value = "") =>
   String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').trim();
 
@@ -52,6 +69,42 @@ export const runQuery = async (cypher, params = {}) => {
 
 const normalizeStationKey = (value) => String(value || "").trim();
 
+const normalizeStationToken = (value = "") =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\bstation\b/g, "")
+    .replace(/\bjunction\b|\bjn\.?\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const buildStationCandidates = (value = "") => {
+  const token = normalizeStationToken(value);
+  if (!token) return [];
+
+  const candidates = new Set([token]);
+  candidates.add(token.replace(/\s+/g, ""));
+
+  const aliases = CITY_STATION_ALIASES[token] || [];
+  for (const alias of aliases) {
+    candidates.add(String(alias).toLowerCase().trim());
+  }
+
+  return Array.from(candidates).filter(Boolean);
+};
+
+const splitStationCandidates = (candidates = []) => {
+  const exactCandidates = Array.from(new Set(
+    candidates
+      .map((candidate) => String(candidate || "").trim().toLowerCase())
+      .filter(Boolean)
+  ));
+
+  const fuzzyCandidates = exactCandidates.filter((candidate) => candidate.length >= 5);
+
+  return { exactCandidates, fuzzyCandidates };
+};
+
 const stationMatches = (value, target) => {
   const normalizedValue = String(value || "").trim().toLowerCase();
   const normalizedTarget = String(target || "").trim().toLowerCase();
@@ -62,7 +115,9 @@ const stationMatches = (value, target) => {
 const getStationConnections = async (station, limit = 25) => {
   const safeStation = normalizeStationKey(station);
   const safeLimit = Math.max(1, Math.min(100, Math.trunc(Number(limit) || 25)));
-  const cacheKey = `${safeStation.toLowerCase()}::${safeLimit}`;
+  const stationCandidates = buildStationCandidates(safeStation);
+  const { exactCandidates, fuzzyCandidates } = splitStationCandidates(stationCandidates);
+  const cacheKey = `${stationCandidates.join("|")}::${safeLimit}`;
   const cached = stationConnectionCache.get(cacheKey);
 
   if (cached && Date.now() - cached.ts < ROUTE_CACHE_TTL_MS) {
@@ -71,10 +126,20 @@ const getStationConnections = async (station, limit = 25) => {
 
   const neighborsQuery = `
   MATCH (s1:Station)<-[:STOPS_AT]-(t:Train)-[:STOPS_AT]->(s2:Station)
-  WHERE any(v IN [s1.name, s1.code, s1.stationCode, s1.station_name, s1.id]
-        WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($station))
-      AND NOT any(v IN [s2.name, s2.code, s2.stationCode, s2.station_name, s2.id]
-      WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($station))
+  WHERE (
+      any(v IN [s1.code, s1.stationCode, s1.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $exactCandidates)
+      OR any(v IN [s1.name, s1.station_name, s1.city]
+        WHERE any(c IN $fuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
+    AND NOT (
+      any(v IN [s2.code, s2.stationCode, s2.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $exactCandidates)
+      OR any(v IN [s2.name, s2.station_name, s2.city]
+        WHERE any(c IN $fuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
   RETURN DISTINCT
          coalesce(s2.code, s2.name, s2.stationCode, s2.station_name, s2.id) AS neighbor,
          collect(DISTINCT coalesce(t.number, t.train_number, t.trainNo, t.no, t.name, "Unknown")) AS trains
@@ -82,7 +147,7 @@ const getStationConnections = async (station, limit = 25) => {
     LIMIT ${safeLimit}
   `;
 
-    const rows = await runQuery(neighborsQuery, { station: safeStation });
+  const rows = await runQuery(neighborsQuery, { exactCandidates, fuzzyCandidates });
 
   const data = rows
     .map((row) => ({
@@ -156,18 +221,32 @@ export const findStationPaths = async (
 export const getAvailableTrains = async (source, destination) => {
   const safeSource = normalizeStationKey(source);
   const safeDestination = normalizeStationKey(destination);
+  const sourceCandidates = buildStationCandidates(safeSource);
+  const destinationCandidates = buildStationCandidates(safeDestination);
+  const { exactCandidates: sourceExactCandidates, fuzzyCandidates: sourceFuzzyCandidates } = splitStationCandidates(sourceCandidates);
+  const { exactCandidates: destinationExactCandidates, fuzzyCandidates: destinationFuzzyCandidates } = splitStationCandidates(destinationCandidates);
 
-  if (!safeSource || !safeDestination) {
+  if (!safeSource || !safeDestination || sourceCandidates.length === 0 || destinationCandidates.length === 0) {
     return [];
   }
 
   const trainsQuery = `
   MATCH (t:Train)-[:STOPS_AT]->(s1:Station),
         (t)-[:STOPS_AT]->(s2:Station)
-  WHERE any(v IN [s1.name, s1.code, s1.stationCode, s1.station_name, s1.id]
-            WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($source))
-    AND any(v IN [s2.name, s2.code, s2.stationCode, s2.station_name, s2.id]
-            WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($destination))
+  WHERE (
+      any(v IN [s1.code, s1.stationCode, s1.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $sourceExactCandidates)
+      OR any(v IN [s1.name, s1.station_name, s1.city]
+        WHERE any(c IN $sourceFuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
+    AND (
+      any(v IN [s2.code, s2.stationCode, s2.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $destinationExactCandidates)
+      OR any(v IN [s2.name, s2.station_name, s2.city]
+        WHERE any(c IN $destinationFuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
   RETURN DISTINCT
          coalesce(t.number, t.train_number, t.trainNo, t.no) AS number,
          coalesce(t.name, t.trainName, t.train_name, t.title, "") AS name,
@@ -178,8 +257,10 @@ export const getAvailableTrains = async (source, destination) => {
 
   try {
     const result = await runQuery(trainsQuery, {
-      source: safeSource,
-      destination: safeDestination,
+      sourceExactCandidates,
+      sourceFuzzyCandidates,
+      destinationExactCandidates,
+      destinationFuzzyCandidates,
     });
     const trains = result
       .map((row) => {
@@ -220,8 +301,12 @@ export const getRouteFeatures = async (source, destination) => {
 
   const safeSource = normalizeStationKey(source);
   const safeDestination = normalizeStationKey(destination);
+  const sourceCandidates = buildStationCandidates(safeSource);
+  const destinationCandidates = buildStationCandidates(safeDestination);
+  const { exactCandidates: sourceExactCandidates, fuzzyCandidates: sourceFuzzyCandidates } = splitStationCandidates(sourceCandidates);
+  const { exactCandidates: destinationExactCandidates, fuzzyCandidates: destinationFuzzyCandidates } = splitStationCandidates(destinationCandidates);
 
-  if (!safeSource || !safeDestination) {
+  if (!safeSource || !safeDestination || sourceCandidates.length === 0 || destinationCandidates.length === 0) {
     return {
       distance: 560,
       stops: 8,
@@ -233,10 +318,20 @@ export const getRouteFeatures = async (source, destination) => {
   const featureQuery = `
   MATCH (t:Train)-[:STOPS_AT]->(s1:Station),
         (t)-[:STOPS_AT]->(s2:Station)
-  WHERE any(v IN [s1.name, s1.code, s1.stationCode, s1.station_name, s1.id]
-            WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($source))
-    AND any(v IN [s2.name, s2.code, s2.stationCode, s2.station_name, s2.id]
-            WHERE toLower(trim(toString(coalesce(v, "")))) = toLower($destination))
+  WHERE (
+      any(v IN [s1.code, s1.stationCode, s1.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $sourceExactCandidates)
+      OR any(v IN [s1.name, s1.station_name, s1.city]
+        WHERE any(c IN $sourceFuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
+    AND (
+      any(v IN [s2.code, s2.stationCode, s2.id]
+        WHERE toLower(trim(toString(coalesce(v, "")))) IN $destinationExactCandidates)
+      OR any(v IN [s2.name, s2.station_name, s2.city]
+        WHERE any(c IN $destinationFuzzyCandidates
+          WHERE toLower(trim(toString(coalesce(v, "")))) CONTAINS c))
+    )
   WITH DISTINCT t
   OPTIONAL MATCH (t)-[:STOPS_AT]->(stop:Station)
   WITH t, count(stop) AS stopCount
@@ -247,8 +342,10 @@ export const getRouteFeatures = async (source, destination) => {
   `;
 
   const result = await runQuery(featureQuery, {
-    source: safeSource,
-    destination: safeDestination,
+    sourceExactCandidates,
+    sourceFuzzyCandidates,
+    destinationExactCandidates,
+    destinationFuzzyCandidates,
   });
   const route = result[0] || {};
 

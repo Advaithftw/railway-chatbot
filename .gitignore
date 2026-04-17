@@ -1,1 +1,10 @@
 .env
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Trained model artifacts
+ticketstatus/model.pkl
+ticketstatus/columns.pkl
+ticketstatus/metrics.json

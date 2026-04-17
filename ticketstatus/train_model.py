@@ -1,11 +1,12 @@
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 import joblib
 import json
-from tqdm import tqdm
+import numpy as np
 
 print("🚀 Loading dataset...")
 df = pd.read_csv("railway_dataset.csv")
@@ -49,12 +50,29 @@ df = df.drop(columns=[
 ], errors="ignore")
 
 # -----------------------------
+# DROP LEAKAGE-PRONE FEATURES
+# Waitlist fields are label-proxy in this synthetic dataset
+# -----------------------------
+df = df.drop(columns=[
+    "Waitlist Position",
+    "Waitlist Missing"
+], errors="ignore")
+
+# -----------------------------
 # DROP NULLS
 # -----------------------------
-df = df.fillna({
-    "Seat Availability": 0,
-    "Travel Distance": df["Travel Distance"].mean(),
-})
+numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+for col in numeric_cols:
+    if col == "Confirmation Status":
+        continue
+    median_value = df[col].median()
+    if pd.isna(median_value):
+        median_value = 0
+    df[col] = df[col].fillna(median_value)
+
+categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+for col in categorical_cols:
+    df[col] = df[col].fillna("Unknown")
 
 # -----------------------------
 # 🔥 AUTO ENCODE EVERYTHING
@@ -73,6 +91,9 @@ print(X.select_dtypes(include=["object"]).columns)
 
 print("📊 Data shape:", X.shape)
 
+# Keep train/test alignment deterministic
+X = X.reindex(sorted(X.columns), axis=1)
+
 # -----------------------------
 # SPLIT
 # -----------------------------
@@ -80,20 +101,69 @@ X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y
 )
 
+# Validation split for threshold tuning/model selection
+X_fit, X_val, y_fit, y_val = train_test_split(
+    X_train, y_train, test_size=0.2, random_state=42, stratify=y_train
+)
+
 # -----------------------------
 # TRAIN WITH PROGRESS BAR
 # -----------------------------
 print("🤖 Training model...")
 
-model = RandomForestClassifier(
-    n_estimators=300,
-    random_state=42,
-    class_weight="balanced_subsample",
-    min_samples_leaf=2,
-    n_jobs=-1,
-)
+model_candidates = {
+    "random_forest": RandomForestClassifier(
+        n_estimators=120,
+        random_state=42,
+        class_weight="balanced_subsample",
+        min_samples_leaf=2,
+        min_samples_split=4,
+        max_features="sqrt",
+        max_depth=14,
+        n_jobs=-1,
+    ),
+    "extra_trees": ExtraTreesClassifier(
+        n_estimators=160,
+        random_state=42,
+        class_weight="balanced_subsample",
+        min_samples_leaf=1,
+        min_samples_split=4,
+        max_features="sqrt",
+        max_depth=14,
+        n_jobs=-1,
+    ),
+}
 
-model.fit(X_train, y_train)
+best_model_name = None
+best_model = None
+best_threshold = 0.5
+best_val_f1 = -1
+
+for model_name, candidate in model_candidates.items():
+    candidate.fit(X_fit, y_fit)
+    val_prob = candidate.predict_proba(X_val)[:, 1]
+
+    local_best_f1 = -1
+    local_best_threshold = 0.5
+    for threshold in np.arange(0.30, 0.71, 0.02):
+        val_pred = (val_prob >= threshold).astype(int)
+        score = f1_score(y_val, val_pred, zero_division=0)
+        if score > local_best_f1:
+            local_best_f1 = score
+            local_best_threshold = float(threshold)
+
+    print(f"🔎 {model_name}: best validation F1={local_best_f1:.4f} at threshold={local_best_threshold:.2f}")
+
+    if local_best_f1 > best_val_f1:
+        best_val_f1 = local_best_f1
+        best_model_name = model_name
+        best_model = candidate
+        best_threshold = local_best_threshold
+
+print(f"✅ Selected model: {best_model_name} (threshold={best_threshold:.2f})")
+
+# Refit selected model on full training partition
+best_model.fit(X_train, y_train)
 
 # -----------------------------
 # CROSS-VALIDATION (more credible than a single holdout)
@@ -101,7 +171,7 @@ model.fit(X_train, y_train)
 print("🔁 Running stratified cross-validation...")
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 cv_scores = cross_val_score(
-    model,
+    best_model,
     X,
     y,
     cv=cv,
@@ -114,7 +184,8 @@ majority_baseline = max(y.mean(), 1 - y.mean())
 # -----------------------------
 # EVALUATE
 # -----------------------------
-y_pred = model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= best_threshold).astype(int)
 
 accuracy = accuracy_score(y_test, y_pred)
 precision = precision_score(y_test, y_pred, zero_division=0)
@@ -129,6 +200,7 @@ print(f"🎯 F1 Score: {f1:.4f}")
 print(f"🎯 CV F1 Mean: {cv_scores.mean():.4f}")
 print(f"🎯 CV F1 Std: {cv_scores.std():.4f}")
 print(f"🎯 Majority Baseline Accuracy: {majority_baseline:.4f}")
+print(f"🎯 Validation-selected threshold: {best_threshold:.2f}")
 print("🧾 Confusion Matrix:")
 print(cm)
 print("📄 Classification Report:")
@@ -142,6 +214,8 @@ metrics = {
     "cv_f1_mean": float(cv_scores.mean()),
     "cv_f1_std": float(cv_scores.std()),
     "baseline_accuracy": float(majority_baseline),
+    "model_name": best_model_name,
+    "threshold": float(best_threshold),
     "confusion_matrix": cm,
     "test_samples": int(len(y_test)),
     "train_samples": int(len(y_train)),
@@ -150,7 +224,7 @@ metrics = {
 # -----------------------------
 # SAVE
 # -----------------------------
-joblib.dump(model, "model.pkl")
+joblib.dump(best_model, "model.pkl")
 joblib.dump(X.columns.tolist(), "columns.pkl")
 
 with open("metrics.json", "w") as f:
