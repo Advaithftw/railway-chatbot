@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Railway Chatbot</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0b1020; color:#e6e9f3; margin:0; }
+    .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; }
+    .card { background:#131a33; border:1px solid #28335c; border-radius:12px; padding:16px; margin-bottom:14px; }
+    input, button { border-radius:8px; border:1px solid #314176; }
+    input { width: calc(100% - 130px); background:#0f1530; color:#e6e9f3; padding:10px; }
+    button { width:110px; margin-left:8px; background:#4f7cff; color:white; padding:10px; cursor:pointer; }
+    .row { display:flex; }
+    .msg { white-space: pre-wrap; margin: 8px 0 0; color:#cfd8ff; }
+    .meta { font-size: 12px; color:#8ea0dc; margin-top: 6px; }
+    .chips button { width:auto; margin: 0 8px 8px 0; padding:6px 10px; font-size:12px; }
+    .chart-wrap { margin-top: 10px; background:#0f1530; border:1px solid #28335c; border-radius:12px; padding:12px; }
+    .chart-title { font-size: 13px; color:#aab7ef; margin-bottom: 8px; }
+    canvas { max-width: 100%; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Railway Chatbot Demo</h2>
+    <div class="card">
+      <div class="chips">
+        <button data-q="trains from csmt to ndls">Route query</button>
+        <button data-q="will wl 45 in 3ac from csmt to ndls get confirmed?">WL prediction</button>
+        <button id="healthBtn">Check health</button>
+        <button id="mlEvalBtn">ML metrics</button>
+        <button id="kgEvalBtn">KG evaluation</button>
+      </div>
+      <div class="row">
+        <input id="query" placeholder="Ask: trains from station x to y..." />
+        <button id="send">Send</button>
+      </div>
+      <div id="status" class="meta"></div>
+    </div>
+    <div id="out"></div>
+  </div>
+
+  <script>
+    const out = document.getElementById("out");
+    const input = document.getElementById("query");
+    const status = document.getElementById("status");
+    let metricsChart = null;
+    let kgChart = null;
+
+    function renderBlock(title, body, meta = "") {
+      const div = document.createElement("div");
+      div.className = "card";
+      div.innerHTML = `<strong>${title}</strong><div class="msg">${body}</div>${meta ? `<div class="meta">${meta}</div>` : ""}`;
+      out.prepend(div);
+    }
+
+    function normalizeValue(v) {
+      if (v == null) return null;
+      if (typeof v === "string" || typeof v === "number") return v;
+      if (typeof v === "object") {
+        if (typeof v.low === "number") return v.low;
+        if (typeof v.toNumber === "function") return v.toNumber();
+      }
+      return String(v);
+    }
+
+    function renderBarChart(containerId, labels, values, title, labelText) {
+      const existing = document.getElementById(containerId);
+      if (existing) existing.remove();
+
+      const wrap = document.createElement("div");
+      wrap.id = containerId;
+      wrap.className = "chart-wrap";
+      wrap.innerHTML = `
+        <div class="chart-title">${title}</div>
+        <canvas></canvas>
+      `;
+      out.prepend(wrap);
+
+      const ctx = wrap.querySelector("canvas").getContext("2d");
+      const chart = new Chart(ctx, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{
+            label: labelText,
+            data: values,
+            backgroundColor: ["#4f7cff", "#7c5cff", "#31c48d", "#f59e0b"],
+            borderRadius: 8,
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: false }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: { color: "#cfd8ff" },
+              grid: { color: "rgba(142,160,220,0.15)" }
+            },
+            x: {
+              ticks: { color: "#cfd8ff" },
+              grid: { display: false }
+            }
+          }
+        }
+      });
+
+      return chart;
+    }
+
+    async function ask(query) {
+      if (!query) return;
+      const t0 = performance.now();
+      status.textContent = "Loading...";
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query })
+        });
+        const json = await res.json();
+        const ms = Math.round(performance.now() - t0);
+
+        if (json.type === "prediction") {
+          renderBlock(
+            "Prediction",
+            `Train: ${json.train || "-"}\nResult: ${json.message}\nProbability: ${json.probability}`,
+            `${ms}ms`
+          );
+        } else if (json.type === "graph") {
+          const isRouteQuery = Boolean(json.route && json.route.source && json.route.destination);
+          const directFromApi = (json.directTrains || []).slice(0, 20).map((t) => {
+            const trainName = normalizeValue(t.name);
+            const trainNumber = normalizeValue(t.number);
+            const trainType = normalizeValue(t.type);
+            return `- ${trainName || "Train"}${trainNumber ? ` (${trainNumber})` : ""}${trainType ? ` [${trainType}]` : ""}`;
+          });
+
+          const lines = (json.result || []).slice(0, 20).map((r) => {
+            const trainName = normalizeValue(r.train) || normalizeValue(r.name);
+            const trainNumber = normalizeValue(r.number);
+            const trainType = normalizeValue(r.type);
+
+            if (trainName) {
+              return `- ${trainName}${trainNumber ? ` (${trainNumber})` : ""}${trainType ? ` [${trainType}]` : ""}`;
+            }
+
+            return `- Train ${trainNumber || "N/A"}${trainType ? ` [${trainType}]` : ""}`;
+          });
+
+          const uniqueDirect = isRouteQuery ? directFromApi : (directFromApi.length ? directFromApi : lines);
+          const directSection = uniqueDirect.length
+            ? `Direct trains:\n${uniqueDirect.join("\n")}`
+            : "Direct trains:\n- No direct trains found";
+
+          const multiHopLines = (json.multiHop || []).slice(0, 5).map((p, idx) => {
+            const stations = Array.isArray(p.stations) ? p.stations : [];
+            const chain = stations.length ? stations.join(" -> ") : "(no chain)";
+            return `${idx + 1}. ${chain} (${p.hops || 0} hop${(p.hops || 0) === 1 ? "" : "s"})`;
+          });
+
+          const multiHopSection = multiHopLines.length
+            ? `\n\nMulti-hop options:\n${multiHopLines.join("\n")}`
+            : "\n\nMulti-hop options:\n- No multi-hop path found";
+
+          const answerLine = json.answer ? `\n\nSummary:\n${json.answer}` : "";
+
+          renderBlock("Route Results", `${directSection}${multiHopSection}${answerLine}`, `${ms}ms`);
+        } else {
+          renderBlock("Response", JSON.stringify(json, null, 2), `${ms}ms`);
+        }
+      } catch (e) {
+        renderBlock("Error", e.message || String(e));
+      } finally {
+        status.textContent = "";
+      }
+    }
+
+    document.getElementById("send").addEventListener("click", () => ask(input.value.trim()));
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") ask(input.value.trim()); });
+
+    document.querySelectorAll("[data-q]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        input.value = btn.getAttribute("data-q");
+        ask(input.value);
+      });
+    });
+
+    document.getElementById("healthBtn").addEventListener("click", async () => {
+      const res = await fetch("/api/health");
+      const json = await res.json();
+      renderBlock("Health", JSON.stringify(json, null, 2));
+    });
+
+    document.getElementById("mlEvalBtn").addEventListener("click", async () => {
+      const t0 = performance.now();
+      status.textContent = "Loading ML metrics...";
+      try {
+        const res = await fetch("/api/evaluate/ml");
+        const json = await res.json();
+        const ms = Math.round(performance.now() - t0);
+
+        if (!res.ok) {
+          throw new Error(json.error || "Failed to load ML metrics");
+        }
+
+        const body = [
+          `Accuracy: ${Number(json.accuracy || 0).toFixed(4)}`,
+          `Precision: ${Number(json.precision || 0).toFixed(4)}`,
+          `Recall: ${Number(json.recall || 0).toFixed(4)}`,
+          `F1 Score: ${Number(json.f1 || 0).toFixed(4)}`,
+          `CV F1 Mean: ${Number(json.cv_f1_mean || 0).toFixed(4)}`,
+          `CV F1 Std: ${Number(json.cv_f1_std || 0).toFixed(4)}`,
+          `Baseline Accuracy: ${Number(json.baseline_accuracy || 0).toFixed(4)}`,
+          `Samples: ${json.samples || 0}`
+        ].join("\n");
+
+        renderBlock("ML Evaluation", body, `${ms}ms`);
+        metricsChart = renderBarChart(
+          "ml-metrics-chart",
+          ["Accuracy", "Precision", "Recall", "F1", "CV F1", "Baseline"],
+          [json.accuracy || 0, json.precision || 0, json.recall || 0, json.f1 || 0, json.cv_f1_mean || 0, json.baseline_accuracy || 0],
+          "ML metrics",
+          "score"
+        );
+      } catch (e) {
+        renderBlock("ML Evaluation Error", e.message || String(e));
+      } finally {
+        status.textContent = "";
+      }
+    });
+
+    document.getElementById("kgEvalBtn").addEventListener("click", async () => {
+      const t0 = performance.now();
+      status.textContent = "Running KG evaluation...";
+      try {
+        const res = await fetch("/api/evaluate/kg?sampleSize=100&maxHops=3&timeoutMs=2000&pathLimit=3");
+        const json = await res.json();
+        const ms = Math.round(performance.now() - t0);
+
+        if (!res.ok) {
+          throw new Error(json.error || "Failed to evaluate KG");
+        }
+
+        const successExamples = (json.examples?.success || []).slice(0, 3).map((e, idx) => {
+          return `${idx + 1}. ${e.source} -> ${e.destination} | ${e.path} | ${e.routeType}`;
+        });
+
+        const failExamples = (json.examples?.fail || []).slice(0, 2).map((e, idx) => {
+          const err = e.error ? ` (${e.error})` : "";
+          return `${idx + 1}. ${e.source} -> ${e.destination}${err}`;
+        });
+
+        const body = [
+          `Coverage: ${Number(json.coveragePercent || 0).toFixed(2)}%`,
+          `Sample Size: ${json.sampleSize || 0}`,
+          `Success Count: ${json.successCount || 0}`,
+          `Direct Paths: ${json.directCount || 0}`,
+          `Multi-hop Paths: ${json.multiHopCount || 0}`,
+          `Timed Out: ${json.timedOut || 0}`,
+          "",
+          "Successful examples:",
+          ...(successExamples.length ? successExamples : ["- None"]),
+          "",
+          "Failed examples:",
+          ...(failExamples.length ? failExamples : ["- None"])
+        ].join("\n");
+
+        renderBlock("KG Evaluation", body, `${ms}ms`);
+        kgChart = renderBarChart(
+          "kg-eval-chart",
+          ["Coverage", "Direct", "Multi-hop"],
+          [json.coveragePercent || 0, json.directCount || 0, json.multiHopCount || 0],
+          "KG evaluation",
+          "value"
+        );
+      } catch (e) {
+        renderBlock("KG Evaluation Error", e.message || String(e));
+      } finally {
+        status.textContent = "";
+      }
+    });
+  </script>
+</body>
+</html>

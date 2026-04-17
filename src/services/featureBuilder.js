@@ -1,6 +1,7 @@
 const normalizeClass = (travelClass = "") => {
   const cls = String(travelClass).toLowerCase().replace(/\s+/g, "").trim();
 
+  if (cls.includes("1ac") || cls === "a1") return "1AC";
   if (cls.includes("2ac") || cls === "a2") return "2AC";
   if (cls.includes("3ac") || cls === "a3") return "3AC";
   if (cls.includes("sl") || cls.includes("sleeper")) return "Sleeper";
@@ -34,6 +35,7 @@ export const buildFeatures = (entities = {}, kgData = {}, trainNumber = null, tr
   };
 
   if (trainNumber) {
+    features["Train Number"] = Number(trainNumber);
     features.train_number = trainNumber;
   }
 

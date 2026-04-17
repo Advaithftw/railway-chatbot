@@ -1,7 +1,10 @@
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 import joblib
+import json
 from tqdm import tqdm
 
 print("🚀 Loading dataset...")
@@ -74,7 +77,7 @@ print("📊 Data shape:", X.shape)
 # SPLIT
 # -----------------------------
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X, y, test_size=0.2, random_state=42, stratify=y
 )
 
 # -----------------------------
@@ -82,22 +85,75 @@ X_train, X_test, y_train, y_test = train_test_split(
 # -----------------------------
 print("🤖 Training model...")
 
-model = RandomForestClassifier(n_estimators=1, warm_start=True)
+model = RandomForestClassifier(
+    n_estimators=300,
+    random_state=42,
+    class_weight="balanced_subsample",
+    min_samples_leaf=2,
+    n_jobs=-1,
+)
 
-for i in tqdm(range(100), desc="Training Progress"):
-    model.n_estimators = i + 1
-    model.fit(X_train, y_train)
+model.fit(X_train, y_train)
+
+# -----------------------------
+# CROSS-VALIDATION (more credible than a single holdout)
+# -----------------------------
+print("🔁 Running stratified cross-validation...")
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = cross_val_score(
+    model,
+    X,
+    y,
+    cv=cv,
+    scoring="f1",
+    n_jobs=-1,
+)
+
+majority_baseline = max(y.mean(), 1 - y.mean())
 
 # -----------------------------
 # EVALUATE
 # -----------------------------
-accuracy = model.score(X_test, y_test)
+y_pred = model.predict(X_test)
+
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred, zero_division=0)
+recall = recall_score(y_test, y_pred, zero_division=0)
+f1 = f1_score(y_test, y_pred, zero_division=0)
+cm = confusion_matrix(y_test, y_pred).tolist()
+
 print(f"🎯 Model accuracy: {accuracy:.4f}")
+print(f"🎯 Precision: {precision:.4f}")
+print(f"🎯 Recall: {recall:.4f}")
+print(f"🎯 F1 Score: {f1:.4f}")
+print(f"🎯 CV F1 Mean: {cv_scores.mean():.4f}")
+print(f"🎯 CV F1 Std: {cv_scores.std():.4f}")
+print(f"🎯 Majority Baseline Accuracy: {majority_baseline:.4f}")
+print("🧾 Confusion Matrix:")
+print(cm)
+print("📄 Classification Report:")
+print(classification_report(y_test, y_pred, zero_division=0))
+
+metrics = {
+    "accuracy": float(accuracy),
+    "precision": float(precision),
+    "recall": float(recall),
+    "f1": float(f1),
+    "cv_f1_mean": float(cv_scores.mean()),
+    "cv_f1_std": float(cv_scores.std()),
+    "baseline_accuracy": float(majority_baseline),
+    "confusion_matrix": cm,
+    "test_samples": int(len(y_test)),
+    "train_samples": int(len(y_train)),
+}
 
 # -----------------------------
 # SAVE
 # -----------------------------
 joblib.dump(model, "model.pkl")
 joblib.dump(X.columns.tolist(), "columns.pkl")
+
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
 
 print("✅ Model trained successfully!")

@@ -52,23 +52,42 @@ const normalizeEntities = (entities = {}) => {
   };
 };
 
-const extractEntitiesRuleBased = (query) => {
+export const extractEntitiesRuleBased = (query) => {
   const text = String(query || "").toLowerCase();
+  const cleanStation = (value = "") => {
+    const normalized = String(value)
+      .replace(/[^a-z\s]/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!normalized) return "Unknown";
+
+    // Remove trailing intent words from conversational queries.
+    const withoutTrailingIntent = normalized.replace(
+      /\b(?:will|can|could|should|get|be|confirm(?:ed)?|status|ticket|chance|probability)\b[\s\S]*$/i,
+      ""
+    ).trim();
+
+    return withoutTrailingIntent || normalized;
+  };
   const wlMatch = text.match(/\bwl\s*(\d+)\b|\bwaitlist\s*(\d+)\b|\b(\d+)\s*wl\b/i);
   const waitlist = Number(wlMatch?.[1] || wlMatch?.[2] || wlMatch?.[3]) || 0;
 
-  const classMatch = text.match(/\b(2\s*ac|3\s*ac|sleeper|sl)\b/i);
+  const classMatch = text.match(/\b(1\s*ac|2\s*ac|3\s*ac|a1|a2|a3|sleeper|sl)\b/i);
   let travelClass = "3AC";
   if (classMatch) {
     const cls = classMatch[1].replace(/\s+/g, "").toLowerCase();
-    if (cls === "2ac") travelClass = "2AC";
-    else if (cls === "3ac") travelClass = "3AC";
+    if (cls === "1ac" || cls === "a1") travelClass = "1AC";
+    else if (cls === "2ac" || cls === "a2") travelClass = "2AC";
+    else if (cls === "3ac" || cls === "a3") travelClass = "3AC";
     else travelClass = "Sleeper";
   }
 
-  const routeMatch = text.match(/from\s+([a-z\s]+?)\s+to\s+([a-z\s]+?)(?:\?|\.|,|$)/i);
-  const source = (routeMatch?.[1]?.trim() || "Unknown").replace(/^banglore$/i, "Bangalore");
-  const destination = (routeMatch?.[2]?.trim() || "Unknown").replace(/^banglore$/i, "Bangalore");
+  const routeMatch = text.match(
+    /from\s+([a-z\s]+?)\s+to\s+([a-z\s]+?)(?=\s+(?:will|can|could|should|get|be|confirm(?:ed)?|status|ticket|chance|probability)\b|\?|\.|,|$)/i
+  );
+  const source = cleanStation(routeMatch?.[1] || "Unknown").replace(/^banglore$/i, "Bangalore");
+  const destination = cleanStation(routeMatch?.[2] || "Unknown").replace(/^banglore$/i, "Bangalore");
 
   const trainMatch = text.match(/train\s*(\d+)\b|\b(\d{5})\b/i);
   const trainNumber = Number(trainMatch?.[1] || trainMatch?.[2]) || null;
@@ -93,6 +112,21 @@ const tryOllamaExtraction = async (query, model, options = undefined) => {
   return normalizeEntities(parseJsonFromText(res.data?.response));
 };
 
+const isPlausibleExtraction = (entities = {}) => {
+  const source = String(entities.source || "").trim().toLowerCase();
+  const destination = String(entities.destination || "").trim().toLowerCase();
+  const travelClass = String(entities.class || "").trim().toLowerCase();
+  const validClasses = new Set(["2ac", "3ac", "sleeper"]);
+
+  // Reject generic placeholders and malformed classes from noisy model output.
+  if (!source || !destination) return false;
+  if (source === "unknown" || destination === "unknown") return false;
+  if (source === "city" || destination === "city") return false;
+  if (!validClasses.has(travelClass)) return false;
+
+  return true;
+};
+
 export const extractEntities = async (query) => {
   const configuredModels = (process.env.OLLAMA_ENTITY_MODELS || "llama3,mistral,phi3,tinyllama")
     .split(",")
@@ -101,7 +135,11 @@ export const extractEntities = async (query) => {
 
   for (const model of configuredModels) {
     try {
-      return await tryOllamaExtraction(query, model);
+      const entities = await tryOllamaExtraction(query, model);
+      if (isPlausibleExtraction(entities)) {
+        return entities;
+      }
+      console.warn(`Entity extraction produced implausible output with model ${model}:`, entities);
     } catch (err) {
       const message = err?.response?.data?.error || err.message;
       console.warn(`Entity extraction failed with model ${model}:`, message);
@@ -109,11 +147,20 @@ export const extractEntities = async (query) => {
   }
 
   try {
-    return await tryOllamaExtraction(query, configuredModels[0] || "llama3", { num_gpu: 0 });
+    const cpuEntities = await tryOllamaExtraction(query, configuredModels[0] || "llama3", { num_gpu: 0 });
+    if (isPlausibleExtraction(cpuEntities)) {
+      return cpuEntities;
+    }
+    console.warn("Entity extraction CPU retry produced implausible output:", cpuEntities);
   } catch (err) {
     const message = err?.response?.data?.error || err.message;
     console.warn("Entity extraction CPU retry failed:", message);
   }
 
+  return extractEntitiesRuleBased(query);
+};
+
+export const extractEntitiesFast = async (query) => {
+  // Fast path for latency-sensitive prediction queries.
   return extractEntitiesRuleBased(query);
 };

@@ -1,8 +1,52 @@
 import { generateCypher } from "../services/llmService.js";
-import { runQuery, getRouteFeatures, getAvailableTrains } from "../services/queryService.js";
-import { extractEntities } from "../services/extractionService.js";
+import { runQuery, getRouteFeatures, getAvailableTrains, findStationPaths } from "../services/queryService.js";
+import { extractEntitiesFast } from "../services/extractionService.js";
 import { buildFeatures } from "../services/featureBuilder.js";
-import { getPrediction } from "../services/predictionService.js";
+import { getPrediction, getModelMetrics } from "../services/predictionService.js";
+import { evaluateKnowledgeGraph } from "../tools/evaluateKg.js";
+
+const MULTI_HOP_MAX_HOPS = Math.max(1, Math.min(8, Number(process.env.MULTI_HOP_MAX_HOPS || 4)));
+const MULTI_HOP_PATH_LIMIT = Math.max(1, Math.min(50, Number(process.env.MULTI_HOP_PATH_LIMIT || 10)));
+
+const cleanRouteToken = (value = "") =>
+  String(value)
+    .replace(/\bstation\b/gi, " ")
+    .replace(/[^a-z0-9\s_-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const extractRouteFromQueryFallback = (queryText = "") => {
+  const text = String(queryText || "");
+  const match = text.match(/from\s+(.+?)\s+to\s+(.+?)(?=\?|\.|,|$)/i);
+  if (!match) return { source: null, destination: null };
+  const source = cleanRouteToken(match[1]);
+  const destination = cleanRouteToken(match[2]);
+  return {
+    source: source || null,
+    destination: destination || null,
+  };
+};
+
+const resolveRouteFromQuery = async (queryText = "") => {
+  try {
+    const entities = await extractEntitiesFast(queryText);
+    const source = cleanRouteToken(entities?.source || "");
+    const destination = cleanRouteToken(entities?.destination || "");
+
+    if (
+      source &&
+      destination &&
+      source.toLowerCase() !== "unknown" &&
+      destination.toLowerCase() !== "unknown"
+    ) {
+      return { source, destination };
+    }
+  } catch (err) {
+    console.warn("Entity-based route extraction failed:", err.message);
+  }
+
+  return extractRouteFromQueryFallback(queryText);
+};
 
 export const chatHandler = async (req, res) => {
   const query = req.body.query?.toLowerCase();
@@ -17,8 +61,8 @@ export const chatHandler = async (req, res) => {
     // =========================================================
     if (query.includes("wl") || query.includes("confirm")) {
 
-      // 🧠 Step 1: Extract structured entities using LLM
-      const entities = await extractEntities(query);
+      // 🧠 Step 1: Fast deterministic entity extraction for low latency
+      const entities = await extractEntitiesFast(query);
       console.log("Entities:", entities);
 
       // 🧠 Step 2: Get KG-based route features
@@ -54,7 +98,7 @@ export const chatHandler = async (req, res) => {
         const predictions = [];
 
         // 🤖 Call model for each train and collect predictions
-        for (const train of availableTrains.slice(0, 10)) {
+        for (const train of availableTrains.slice(0, 5)) {
           const trainType = train.type || train.name?.split(" ")[0] || "Express";
           const features = buildFeatures(entities, kgData, train.number, trainType);
           try {
@@ -136,16 +180,93 @@ export const chatHandler = async (req, res) => {
     const dbResult = await runQuery(cypher);
     console.log("DB Result:", dbResult);
 
+    // Route extraction for direct + multi-hop augmentation
+    const route = await resolveRouteFromQuery(query);
+
+    let directTrains = [];
+    if (route.source && route.destination) {
+      try {
+        directTrains = await getAvailableTrains(route.source, route.destination);
+      } catch (err) {
+        console.warn("Direct train lookup failed:", err.message);
+      }
+    }
+
+    let multiHop = [];
+    if (route.source && route.destination) {
+      try {
+        multiHop = await findStationPaths(route.source, route.destination, {
+          maxHops: MULTI_HOP_MAX_HOPS,
+          limit: MULTI_HOP_PATH_LIMIT,
+        });
+      } catch (err) {
+        console.warn("Multi-hop search failed:", err.message);
+      }
+    }
+
+    const isRouteQuery = Boolean(route.source && route.destination);
+    const directCount = isRouteQuery ? directTrains.length : (dbResult?.length || 0);
+    const hasDirect = directCount > 0;
+    const answer = hasDirect
+      ? `Found ${directCount} direct train option(s).${multiHop.length ? ` Also found ${multiHop.length} multi-hop path(s).` : ""}`
+      : multiHop.length
+      ? `No direct trains found; discovered ${multiHop.length} multi-hop path(s).`
+      : "No trains or multi-hop paths found for this route in current graph data.";
+
     return res.json({
       type: "graph",
       cypher,
-      result: dbResult
+      result: isRouteQuery ? [] : dbResult,
+      directTrains,
+      multiHop,
+      route,
+      answer
     });
 
   } catch (err) {
     console.error("ERROR:", err);
     return res.status(500).json({
       error: err.message || "Something went wrong"
+    });
+  }
+};
+
+export const mlEvaluationHandler = async (_req, res) => {
+  try {
+    const metrics = await getModelMetrics();
+    return res.json({
+      type: "ml-evaluation",
+      ...metrics,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message || "Failed to fetch ML metrics"
+    });
+  }
+};
+
+export const kgEvaluationHandler = async (req, res) => {
+  try {
+    const sampleSize = Number(req.query.sampleSize || process.env.EVAL_SAMPLE_SIZE || 100);
+    const maxHops = Number(req.query.maxHops || process.env.KG_EVAL_MAX_HOPS || 3);
+    const timeoutMs = Number(req.query.timeoutMs || process.env.KG_EVAL_TIMEOUT_MS || 2000);
+    const pathLimit = Number(req.query.pathLimit || process.env.KG_EVAL_PATH_LIMIT || 3);
+
+    const evaluation = await evaluateKnowledgeGraph({
+      sampleSize,
+      maxHops,
+      queryTimeoutMs: timeoutMs,
+      pathLimit,
+      enableLogs: false,
+    });
+
+    return res.json({
+      type: "kg-evaluation",
+      ...evaluation,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message || "Failed to evaluate KG"
     });
   }
 };
